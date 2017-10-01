@@ -1,79 +1,68 @@
-from datetime import datetime as DT
+import logging
+from datetime import timedelta, datetime as DT
 import pyspark.sql.functions as F
+from mozetl.utils import format_spark_path
 from mozetl.clientsdaily.rollup import extract_search_counts, to_profile_day_aggregates
 from mozetl.experimentsdaily.rollup import to_experiment_profile_day_aggregates
 
-DEFAULT_VERSION = DT.strftime(DT.utcnow(), "%Y%m%d")
+logging.getLogger("py4j").setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+DF = "%Y%m%d"
+DEFAULT_VERSION = DT.strftime(DT.utcnow(), DF)
+
 
 def save(data, base_path, name, output_version):
-	output_path = "{}/{}/v{}/".format(base_path, name, output_version)
-	data.coalesce(10).write.mode("overwrite").parquet(output_path)
+    output_path = "{}/{}/v{}/".format(base_path, name, output_version)
+    logger.info("Saving {} to {}".format(name, output_path))
+    data.coalesce(10).write.mode("overwrite").parquet(output_path)
 
-# First, get the main summary data:
-main_summary_path = "s3://telemetry-parquet/main_summary/v4/"
-main_summary = spark.read.option("mergeSchema", "true").parquet(main_summary_path)
+def extract_main_summary(input_bucket, input_prefix, sample_id, experiment_end_date):
+    main_summary_path = format_spark_path(input_bucket, input_prefix)
+    logger.info("Reading main_summary data from {}".format(main_summary_path))
+    main_summary = spark.read.option("mergeSchema", "true").parquet(main_summary_path)
 
-do_sampling = True
-if do_sampling:
-	main_summary = main_summary.where("sample_id = '42'")
+    if sample_id:
+        logger.info("Applying sample_id {}".format(sample_id))
+        main_summary = main_summary.where("sample_id = '{}'".format(sample_id))
 
-# Next, get the data for experiments:
-experiment_start = '20170907'
-lookback_start = '20170810'  # 4 weeks earlier
-experiment_id = '@unified-urlbar-shield-study-opt-out'
-
-exp_branch_col_expr = "experiments['{}']".format(experiment_id)
-
-experiments = main_summary.where(main_summary.submission_date_s3 >= experiment_start) \
-                          .withColumn("experiment_branch", F.expr(exp_branch_col_expr)) \
-                          .where("experiment_branch IS NOT NULL") \
-                          .withColumn("experiment_id", F.lit(experiment_id)) \
-                          .dropDuplicates("document_id")
-
-# Stash the resulting dataframe:
-output_bucket = "net-mozaws-prod-us-west-2-pipeline-analysis"
-output_prefix = "mreid/unified_search_data"
-output_base_path = "s3://{}/{}/".format(output_bucket, output_prefix)
-output_version = DT.strftime(DT.utcnow(), "%Y%m%d")
-exp_name = "main_summary_experiments"
-save(experiments, output_base_path, exp_name, output_version)
-
-# Then get all the client_ids in the study:
-experiment_subjects = experiments.select("client_id").distinct()
-
-# Finally, get the "look back" data for the same set of client_ids:
-lookback_all = main_summary.where(main_summary.submission_date_s3 >= lookback_start) \
-                           .withColumn("experiment_branch", F.expr(exp_branch_col_expr))
-                           .where("experiment_branch IS NULL")
-lookback = lookback_all.join(experiment_subjects, 'client_id', 'inner') \
-                       .dropDuplicates("document_id")
-
-lb_name = "lookback"
-save(lookback, output_base_path, lb_name, output_version)
-
-# Transform `experiments` into clients-daily form
-exp_with_search = extract_search_counts(experiments)
-exp_daily = to_experiment_profile_day_aggregates(exp_with_search)
-exp_daily_name = "{}_daily".format(exp_name)
-save(exp_daily, output_base_path, exp_daily_name, output_version)
-
-# Transform `lookback` to clients-daily form:
-from mozetl.clientsdaily.fields import ACTIVITY_DATE_COLUMN
-lookback_with_day = lookback.select("*", ACTIVITY_DATE_COLUMN)
-lookback_with_search = extract_search_counts(lookback_with_day)
-lookback_daily = to_profile_day_aggregates(lookback_with_search)
-lb_daily_name = "{}_daily".format(lb_name)
-save(lookback_daily, output_base_path, lb_daily_name, output_version)
+    if experiment_end_date:
+        logger.info("Limiting to data on or before {}".format(experiment_end_date))
+        main_summary = main_summary.where(main_summary.submission_date_s3 <= experiment_end_date)
+    return main_summary
 
 
-def extract():
-	pass
+def get_branch_expr(experiment_id):
+    return "experiments['{}']".format(experiment_id)
 
-def transform():
-	pass
 
-def load():
-	pass
+def extract_experiments(main_summary, experiment_id, start_date):
+    logger.info("Gathering experiment data for '{}'".format(experiment_id))
+    branch_expr = get_branch_expr(experiment_id)
+    experiments = main_summary.where(main_summary.submission_date_s3 >= start_date) \
+                              .withColumn("experiment_branch", F.expr(branch_expr)) \
+                              .where("experiment_branch IS NOT NULL") \
+                              .withColumn("experiment_id", F.lit(experiment_id)) \
+                              .dropDuplicates(["document_id"])
+    return experiments
+
+
+def rewind_date(start_date_str, rewind_days, date_format=DF):
+    date_parsed = DT.strptime(start_date_str, date_format)
+    return DT.strftime(date_parsed - timedelta(rewind_days), date_format)
+
+def get_lookback(main_summary, lookback_start, experiment_id, clients):
+    logger.info("Fetching lookback data back to {}".format(lookback_start))
+    branch_expr = get_branch_expr(experiment_id)
+    lookback_all = main_summary.where(main_summary.submission_date_s3 >= lookback_start) \
+                               .withColumn("experiment_branch", F.expr(branch_expr)) \
+                               .where("experiment_branch IS NULL")
+
+    logger.info("Joining with client_ids".format(name, output_path))
+    lookback = lookback_all.join(clients, 'client_id', 'inner') \
+                           .dropDuplicates(["document_id"])
+    return lookback
+
 
 @click.command()
 @click.option('--input-bucket',
@@ -106,23 +95,52 @@ def load():
               default=None,
               help='Sample_id to restrict results to')
 
-def main(input_bucket, input_prefix, output_bucket, output_prefix, output_version):
+def main(input_bucket, input_prefix, output_bucket, output_prefix,
+         output_version, experiment_id, experiment_start_date,
+         experiment_end_date, lookback_days, sample_id):
     """
     Extract unified search data, orient it like clients-daily.
     """
     spark = SparkSession.builder.appName("experiment_lookback_daily").getOrCreate()
 
-    parquet_path = format_spark_path(input_bucket, input_prefix)
-    frame = load_experiments_summary(spark, parquet_path)
-    searches_frame = extract_search_counts(frame)
-    results = to_experiment_profile_day_aggregates(searches_frame)
-    spark.conf.set(
-        "mapreduce.fileoutputcommitter.marksuccessfuljobs", "false"
-    )  # Don't write _SUCCESS files, which interfere w/ReDash discovery
-    output_base_path = "{}/v{}".format(
-        format_spark_path(output_bucket, output_prefix),
-        output_version)
-    results.write.mode("overwrite").parquet(output_base_path)
+    # First, get the main summary data:
+    main_summary = extract_main_summary(input_bucket, input_prefix, sample_id, experiment_end_date)
+
+    # Next, get the data for experiments:
+    experiments = extract_experiments(main_summary, experiment_id, experiment_start_date)
+
+    # Stash the resulting dataframe:
+    output_base_path = format_spark_path(output_bucket, output_prefix)
+    exp_name = "experiments"
+    save(experiments, output_base_path, exp_name, output_version)
+
+    # Transform `experiments` into clients-daily form
+    logger.info("Aggregating experiments by client-day")
+    exp_with_search = extract_search_counts(experiments)
+    exp_daily = to_experiment_profile_day_aggregates(exp_with_search)
+    exp_daily_name = "{}_daily".format(exp_name)
+    save(exp_daily, output_base_path, exp_daily_name, output_version)
+
+    # Then get all the client_ids in the study:
+    logger.info("Getting experimental client_ids")
+    experiment_subjects = experiments.select("client_id").distinct()
+
+    # Finally, get the "look back" data for the same set of client_ids:
+    lookback_start = rewind_date(experiment_start_date, lookback_days)
+    lookback = get_lookback(main_summary, lookback_start, experiment_subjects)
+    lb_name = "lookback"
+    save(lookback, output_base_path, lb_name, output_version)
+
+    # Transform `lookback` to clients-daily form:
+    logger.info("Aggregating lookback by client-day")
+    from mozetl.clientsdaily.fields import ACTIVITY_DATE_COLUMN
+    lookback_with_day = lookback.select("*", ACTIVITY_DATE_COLUMN)
+    lookback_with_search = extract_search_counts(lookback_with_day)
+    lookback_daily = to_profile_day_aggregates(lookback_with_search)
+    lb_daily_name = "{}_daily".format(lb_name)
+    save(lookback_daily, output_base_path, lb_daily_name, output_version)
+
+    logger.info("All done for experiment '{}' for {}".format(experiment_id, output_version))
 
 
 if __name__ == '__main__':
