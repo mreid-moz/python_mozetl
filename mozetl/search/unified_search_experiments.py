@@ -17,6 +17,7 @@ def save(data, base_path, name, output_version):
     logger.info("Saving {} to {}".format(name, output_path))
     data.coalesce(10).write.mode("overwrite").parquet(output_path)
 
+
 def extract_main_summary(input_bucket, input_prefix, sample_id, experiment_end_date):
     main_summary_path = format_spark_path(input_bucket, input_prefix)
     logger.info("Reading main_summary data from {}".format(main_summary_path))
@@ -50,6 +51,7 @@ def extract_experiments(main_summary, experiment_id, start_date):
 def rewind_date(start_date_str, rewind_days, date_format=DF):
     date_parsed = DT.strptime(start_date_str, date_format)
     return DT.strftime(date_parsed - timedelta(rewind_days), date_format)
+
 
 def get_lookback(main_summary, lookback_start, experiment_id, clients):
     logger.info("Fetching lookback data back to {}".format(lookback_start))
@@ -94,7 +96,6 @@ def get_lookback(main_summary, lookback_start, experiment_id, clients):
 @click.option('--sample-id',
               default=None,
               help='Sample_id to restrict results to')
-
 def main(input_bucket, input_prefix, output_bucket, output_prefix,
          output_version, experiment_id, experiment_start_date,
          experiment_end_date, lookback_days, sample_id):
